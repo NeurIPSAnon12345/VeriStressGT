@@ -4,8 +4,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import resource
+import shutil
 import subprocess
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -120,6 +123,28 @@ def _collect_jobs(bench_dir: Path, manifest: Dict[str, Any], only_instances: Opt
     return jobs
 
 
+def _rlimit_as_supported() -> bool:
+    """Return True only if RLIMIT_AS can actually be set on this platform."""
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        limit = soft if soft != resource.RLIM_INFINITY else hard
+        if limit == resource.RLIM_INFINITY:
+            # Can't probe against infinity; attempt a harmless set/restore.
+            resource.setrlimit(resource.RLIMIT_AS, (soft, hard))
+        return True
+    except Exception:
+        return False
+
+
+def _make_mem_preexec(mem_bytes: int):
+    def _fn():
+        try:
+            resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
+        except Exception:
+            pass
+    return _fn
+
+
 def _run_one(
     job: InstanceJob,
     verifier_name: str,
@@ -129,6 +154,7 @@ def _run_one(
     out_dir: Path,
     timeout_s: Optional[float],
     conda_env: Optional[str] = None,
+    max_memory_bytes: Optional[int] = None,
 ) -> Dict[str, Any]:
     logs_dir = out_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -143,7 +169,12 @@ def _run_one(
 
     # Auto-wrap in conda env if the verifier declares one.
     if conda_env:
-        cmd = ["conda", "run", "-n", conda_env, "--no-capture-output"] + cmd
+        conda_exe = (
+            os.environ.get("CONDA_EXE")
+            or shutil.which("conda")
+            or "conda"
+        )
+        cmd = [conda_exe, "run", "-n", conda_env, "--no-capture-output"] + cmd
 
     t0 = time.time()
     timed_out = False
@@ -159,6 +190,7 @@ def _run_one(
             text=True,
             timeout=timeout_s if timeout_s and timeout_s > 0 else None,
             env=os.environ.copy(),
+            preexec_fn=_make_mem_preexec(max_memory_bytes) if max_memory_bytes else None,
         )
         rc = int(proc.returncode)
         stdout = proc.stdout or ""
@@ -170,7 +202,13 @@ def _run_one(
         stderr = (e.stderr or "") if isinstance(e.stderr, str) else ""
     except Exception as e:
         rc = 1
-        stderr = f"{stderr}\n[verify_benchmark] exception: {repr(e)}\n"
+        stderr = (
+            f"{stderr}\n"
+            f"[verify_benchmark] failed to launch verifier\n"
+            f"  cmd: {cmd}\n"
+            f"  cwd: {workdir}\n"
+            f"{traceback.format_exc()}"
+        )
 
     wall = time.time() - t0
 
@@ -260,6 +298,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     ap.add_argument("--out_dir", required=True, help="Where to write logs/results.")
     ap.add_argument("--timeout", type=float, default=None, help="Per-instance timeout (seconds).")
     ap.add_argument("--jobs", type=int, default=1, help="Parallelism.")
+    ap.add_argument("--max_memory_gb", type=float, default=None, help="Per-instance memory cap in GB (RLIMIT_AS). Exceeded processes are killed and recorded as ERROR.")
     ap.add_argument("--instances", type=str, nargs="*", default=None, help="Optional list of instance ids to run.")
     ap.add_argument("--overwrite", action="store_true", help="Overwrite out_dir if it exists.")
 
@@ -285,6 +324,19 @@ def main(argv: Optional[List[str]] = None) -> None:
     if conda_env:
         print(f"[VeriStressGT] Will run {args.verifier} in conda env: {conda_env}")
 
+    max_memory_bytes: Optional[int] = (
+        int(args.max_memory_gb * 1024 ** 3) if args.max_memory_gb else None
+    )
+    if max_memory_bytes:
+        if _rlimit_as_supported():
+            print(f"[VeriStressGT] Per-instance memory cap: {args.max_memory_gb:.1f} GB (RLIMIT_AS)")
+        else:
+            print(
+                f"[VeriStressGT] WARNING: RLIMIT_AS is not enforced on this platform "
+                f"(macOS does not support it). --max_memory_gb will have no effect."
+            )
+            max_memory_bytes = None
+
     run_cfg = {
         "benchmark": str(bench_dir),
         "manifest_construction": manifest.get("construction"),
@@ -292,6 +344,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         "conda_env": conda_env,
         "timeout": args.timeout,
         "jobs": args.jobs,
+        "max_memory_gb": args.max_memory_gb,
         "git_commit": _git_commit(),
         "verifier_args": vars(vargs),
     }
@@ -316,6 +369,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                     out_dir,
                     args.timeout,
                     conda_env,
+                    max_memory_bytes,
                 )
             )
 
