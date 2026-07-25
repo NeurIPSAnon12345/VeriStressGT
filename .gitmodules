@@ -13,9 +13,6 @@
 [submodule "src/VeriStressGT/verifiers/Marabou"]
 	path = src/VeriStressGT/verifiers/Marabou
 	url = https://github.com/NeuralNetworkVerification/Marabou.git
-[submodule "src/VeriStressGT/src/VeriStressGT/verifiers/pyrat"]
-	path = src/VeriStressGT/src/VeriStressGT/verifiers/pyrat
-	url = https://git.frama-c.com/pub/pyrat.git
 [submodule "src/VeriStressGT/verifiers/pyrat"]
 	path = src/VeriStressGT/verifiers/pyrat
 	url = https://git.frama-c.com/pub/pyrat.git
